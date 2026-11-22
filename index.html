@@ -18,15 +18,20 @@
                      建物位置には整合していないプロシージャル配置。default off
     ?render=rrm|loop rrm=requestRenderMode (default) / loop=常時描画
     ?tiles=direct|proxy    direct=PLATEAU https 直接 (正, default) / proxy=ローカル server.mjs 経由 (VM 検証用)
-    ?renderer=tileset|model tileset=Cesium3DTileset (default) / model=メイン側が抽出した
-                     24枚の GLB を Cesium.Model で個別読み (sendai-real/models へのシンボリックリンク経由、
-                     modelMatrix=IDENTITY)。tileset 描画経路の代替検証用。
+    ?renderer=tileset|model tileset=Cesium3DTileset / model=メイン側が抽出した
+                     24枚の GLB を Cesium.Model で個別読み (models/ 配下、modelMatrix=IDENTITY)。
+                     無指定時の既定はプロファイル依存 (desktop=tileset / mobile=model、
+                     2026-11-22 第2段対策。判断根拠は README の VM 定量比較)。
     ?terrain=ellipsoid|dem ellipsoid=楕円体地形 (default、従来挙動) / dem=国土地理院 標高タイル
                      (dem_png) を CustomHeightmapTerrainProvider で読む地形 (到達度検証用、本採用ではない)。
                      dem_png は標高 (ジオイド基準) の PNG エンコーディング (公式仕様: x=2^16*R+2^8*G+B、
                      x<2^23 で h=x*0.01m、x=2^23 が無効値、x>2^23 で h=(x-2^24)*0.01m、提供は z14 まで)。
                      Cesium の地形高は楕円体高のため、標高にジオイド高 +40.67m (heightfix の較正値) を
                      加算して整合させる。z15 以上は z14 タイルを細分してサンプルする。
+                     モバイルプロファイル時は、terrain=dem を指定しても ?dem=force がない限り
+                     ellipsoid に落とす (クラッシュ回避優先。第1段対策後も実機で使えない重さ
+                     だった所見を受けた第2段対策。詳細は README)。
+    ?dem=force       モバイルでも terrain=dem を強制する (切り分け検証専用)。
     ?heightfix=on|off on=カメラ高度の基準面補正 (default)。KEYS の camH/lookH は対地高度のまま、
                      地点ごとの基盤楕円体高 (BASE_V1/BASE_V2) を加算して楕円体高へ変換する。
                      off=補正なし (従来挙動の再現用)。
@@ -35,11 +40,13 @@
                      DEM の差の中央値 (n=25, 市街地, 標準偏差 0.54m) で較正。詳細は README と
                      tools/measure_base.py / tools/base-measure.json を参照。
     ?mobile=1|0      iPhone 向け軽量プロファイル。無指定時は自動判定 (タッチ主体+小画面、
-                     または iOS UA のとき有効)。有効時: tileset SSE 32、resolutionScale 1.5、
-                     globe SSE 3、DEM heightmap 33x33、DEM キャッシュ上限 24 枚、
-                     tileset キャッシュ 128MiB 上限。デスクトップの既定挙動は変えない。
+                     または iOS UA のとき有効)。有効時 (第2段, 2026-11-22): renderer 既定=model、
+                     terrain=dem 抑制 (?dem=force で解除)、tileset SSE 48、resolutionScale 1.0、
+                     globe SSE 3、globe タイルキャッシュ 50 枚、RequestScheduler 同時要求抑制
+                     (全体 24 / サーバ別 4)、DEM heightmap 33x33、DEM キャッシュ上限 24 枚、
+                     tileset キャッシュ 64MiB 上限。デスクトップの既定挙動は変えない。
     ?sse=<num>       tileset の maximumScreenSpaceError の上書き (全プロファイル共通)。
-                     無指定時は desktop=16 / mobile=32。
+                     無指定時は desktop=16 / mobile=48。
     ?debug=1         デバッグ表示
   検証窓口: window.__setP(p) / window.__ready() / window.__getState()
 -->
@@ -98,23 +105,33 @@ const Q = new URLSearchParams(location.search);
 const ROUTE_ID = Q.get("route") === "v2" ? "v2" : "v1";
 const GRADE_ID = ["day", "dusk", "night"].includes(Q.get("grade")) ? Q.get("grade") : "dusk";
 const RENDER_LOOP = Q.get("render") === "loop";
-const RENDERER = Q.get("renderer") === "model" ? "model" : "tileset";
+const RENDERER_PARAM = Q.get("renderer"); // 実効値はプロファイル決定後に確定 (下記)
 const TILES_PROXY = Q.get("tiles") === "proxy";
 const HEIGHTFIX = Q.get("heightfix") !== "off"; // default on
-const TERRAIN = Q.get("terrain") === "dem" ? "dem" : "ellipsoid"; // 地形プロバイダ切替 (検証用)
+const TERRAIN_REQ = Q.get("terrain") === "dem" ? "dem" : "ellipsoid"; // 要求値 (実効値は下記)
+const DEM_FORCE = Q.get("dem") === "force"; // モバイルでの DEM 抑制を解除する明示指定
 const LIGHTS = Q.get("lights") === "on"; // 窓明かり点群 (試作レイヤ)
 const DEBUG = Q.get("debug") === "1";
 
 // ---- iPhone 向け軽量プロファイル (?mobile=1|0、無指定時は自動判定) ----
-// 経緯: 2026-11-22、Shibu の iPhone / Safari で ?route=v2&terrain=dem を開くと
+// 経緯: 2026-11-22 21:53、Shibu の iPhone / Safari で ?route=v2&terrain=dem を開くと
 // 「問題が繰り返し起きました」(Web コンテンツプロセスの繰り返しクラッシュ) で表示不能だった。
-// 原因の断定はできないが、負荷側の候補は (a) DEM 地形のタイル処理 (65x65 サンプル/タイル、
-// デコード済みタイルの無制限キャッシュ)、(b) tileset の SSE 16 + 既定キャッシュ (512MiB 級)、
-// (c) devicePixelRatio 3 でのフル解像度描画。プロファイルはこの3点をまとめて下げる。
-// 既定値の決め方: 明示パラメータが最優先。無指定時は「タッチ主体 + 小画面、または iOS UA」の
-// ときだけ自動で有効にする。デスクトップ検証環境 (VM Chromium、非タッチ) では自動判定が
-// 入らないため、従来の検証挙動は変わらない。本編のティア思想と同様、プロファイル外の
-// 既定 (SSE 16 等) は検証なしに変えない。
+// 第1段 (SSE 32、キャッシュ 128MiB、resolutionScale 1.5、DEM 33x33+上限) を公開したが、
+// 同日 22:08 に「だめだね重すぎる」との第2の所見があり、対策後も実機では使えない重さ
+// という結果になった。よって第2段では「負荷の上限が読めない要素をモバイルから外す」
+// 方針に切り替える:
+//   (1) renderer 既定を model にする。GLB 24枚の総量は約78.7MB で固定され、読み終えれば
+//       それ以上増えない。tileset ストリーミングは SSE を上げても表示範囲に比例して
+//       転送・保持が増え続け、上限が読めない (VM 実測は README)。
+//   (2) terrain=dem はモバイルでは ?dem=force の明示がない限り ellipsoid に落とす。
+//       DEM はクラッシュした構成そのものの一要素であり、地形の段差対策としての効果は
+//       デスクトップ検証で確認済みだが、モバイルでは「開けること」を優先する。
+//   (3) tileset を明示指定した場合に備え、SSE 48 / キャッシュ 64MiB / resolutionScale 1.0 /
+//       RequestScheduler 同時要求抑制まで追加で下げる。
+// 原因の断定はできない (候補は README)。既定値の決め方: 明示パラメータが最優先。
+// 無指定時は「タッチ主体 + 小画面、または iOS UA」のときだけ自動で有効にする。
+// デスクトップ検証環境 (VM Chromium、非タッチ) では自動判定が入らないため、
+// 従来の検証挙動は変わらない。プロファイル外の既定 (desktop SSE 16 等) は変えない。
 const MOBILE_AUTO = (() => {
   try {
     const coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
@@ -124,14 +141,30 @@ const MOBILE_AUTO = (() => {
   } catch (e) { return false; }
 })();
 const MOBILE = Q.get("mobile") === "1" ? true : Q.get("mobile") === "0" ? false : MOBILE_AUTO;
+// 実効 renderer: 明示指定が最優先。無指定時は mobile=model / desktop=tileset。
+const RENDERER = RENDERER_PARAM === "model" ? "model"
+               : RENDERER_PARAM === "tileset" ? "tileset"
+               : (MOBILE ? "model" : "tileset");
+// 実効 terrain: モバイルでは dem 要求を ?dem=force がない限り抑制する (上記 (2))。
+const DEM_SUPPRESSED = MOBILE && TERRAIN_REQ === "dem" && !DEM_FORCE;
+const TERRAIN = DEM_SUPPRESSED ? "ellipsoid" : TERRAIN_REQ;
 // ?sse= は全プロファイル共通の上書き (tileset の maximumScreenSpaceError)
 const SSE_PARAM = parseFloat(Q.get("sse"));
-const TILESET_SSE = Number.isFinite(SSE_PARAM) && SSE_PARAM > 0 ? SSE_PARAM : (MOBILE ? 32 : 16);
-const RES_SCALE = MOBILE ? 1.5 : null;              // null = Cesium 既定 (devicePixelRatio 追従)
+const TILESET_SSE = Number.isFinite(SSE_PARAM) && SSE_PARAM > 0 ? SSE_PARAM : (MOBILE ? 48 : 16);
+const RES_SCALE = MOBILE ? 1.0 : null;              // null = Cesium 既定 (devicePixelRatio 追従)
 const HM_SIZE = MOBILE ? 33 : 65;                   // DEM heightmap の辺サンプル数
 const DEM_CACHE_CAP = MOBILE ? 24 : 96;             // DEM デコード済みタイルの保持上限 (1枚 256KiB)
-const TILESET_CACHE_BYTES = MOBILE ? 128 * 1024 * 1024 : null;    // null = Cesium 既定
-const TILESET_OVERFLOW_BYTES = MOBILE ? 64 * 1024 * 1024 : null;  // null = Cesium 既定
+const TILESET_CACHE_BYTES = MOBILE ? 64 * 1024 * 1024 : null;     // null = Cesium 既定
+const TILESET_OVERFLOW_BYTES = MOBILE ? 32 * 1024 * 1024 : null;  // null = Cesium 既定
+// 同時リクエスト数の抑制 (Cesium 1.124 の RequestScheduler 静的上限)。
+// 既定は全体 50 / サーバ別 6 で、タイルのデコードと GPU アップロードが一斉に走り
+// メモリの瞬間ピークを作る。モバイルでは全体 24 / サーバ別 4 に絞る。
+// Viewer 生成 (≒ ロード開始) より前に設定する必要があるため、ここで適用する。
+const RS_MAX = MOBILE ? 24 : null, RS_PER_SERVER = MOBILE ? 4 : null;
+if (MOBILE) {
+  Cesium.RequestScheduler.maximumRequests = RS_MAX;
+  Cesium.RequestScheduler.maximumRequestsPerServer = RS_PER_SERVER;
+}
 
 // ---- Data sources: direct https is canonical; /remote/ proxy only for local VM verification ----
 const PLATEAU_HOST = "assets.cms.plateau.reearth.io";
@@ -266,7 +299,10 @@ const viewer = new Cesium.Viewer("cesiumContainer", {
 // 軽量プロファイルの描画側: 解像度スケールを 1.5 に抑える (iPhone DPR 3 のままだと
 // 描画ピクセル数が約4倍になる) + 地球タイルの SSE を 2→3 に緩めて地形/画像タイル数を減らす。
 if (RES_SCALE) viewer.resolutionScale = RES_SCALE;
-if (MOBILE) viewer.scene.globe.maximumScreenSpaceError = 3;
+if (MOBILE) {
+  viewer.scene.globe.maximumScreenSpaceError = 3;
+  viewer.scene.globe.tileCacheSize = 50; // 既定 100。地表タイルテクスチャの保持を半減
+}
 
 // ---- Grade presets (本格版, 2026-11-22 夜・夕方再構成の検証で実装) ----
 // 方針: 太陽位置は viewer.clock の JulianDate を正とし、Cesium の大気散乱
@@ -379,24 +415,8 @@ let tileset = null;
 let statPending = -1, statProcessing = -1; // from tileLoadProgressEvent
 let tilesetError = "";
 let modelsTotal = 0, modelsLoaded = 0, modelsFailed = 0, modelsError = "";
-if (RENDERER === "model") {
-  // 代替経路: メイン側 (sendai-real) が PLATEAU のリーフタイル .b3dm から抽出した GLB 24枚を
-  // Cesium.Model で個別に読む。GLB 側に実座標が焼き込まれているため modelMatrix は IDENTITY
-  // (メイン側 index.html の実績方式を踏襲)。配信は sendai-scroll/models -> sendai-real/models の symlink。
-  fetch("/models/manifest.json").then(r => r.json()).then(names => {
-    modelsTotal = names.length;
-    return Promise.all(names.map(n =>
-      Cesium.Model.fromGltfAsync({ url: "/models/" + n, modelMatrix: Cesium.Matrix4.IDENTITY })
-        .then(m => { viewer.scene.primitives.add(m); modelsLoaded++; viewer.scene.requestRender(); })
-        .catch(e => { modelsFailed++; console.log("model failed " + n + ": " + e); })
-    ));
-  }).then(() => { applyP(dispP, true); })
-    .catch(e => {
-      modelsError = String(e);
-      statusEl.style.display = "block";
-      statusEl.textContent = "model manifest error: " + modelsError;
-    });
-} else {
+let modelFallback = false; // model が使えず tileset に倒したか (検証窓口で公開)
+function startTileset() {
   Cesium.Cesium3DTileset.fromUrl(TILESET_URL, {
     maximumScreenSpaceError: TILESET_SSE,
     // 軽量プロファイルでは tileset の保持キャッシュにも上限を付ける (Cesium 既定は 512MiB 級で、
@@ -420,6 +440,40 @@ if (RENDERER === "model") {
     statusEl.textContent = "tileset error: " + tilesetError;
   });
 }
+function startModels() {
+  // 代替経路: メイン側 (sendai-real) が PLATEAU のリーフタイル .b3dm から抽出した GLB 24枚を
+  // Cesium.Model で個別に読む。GLB 側に実座標が焼き込まれているため modelMatrix は IDENTITY
+  // (メイン側 index.html の実績方式を踏襲)。パスは相対 (models/) にし、GitHub Pages の
+  // サブパス配信 (/muse-city-lab/) でも壊れないようにする。ローカル検証では
+  // sendai-scroll/models -> sendai-real/models の symlink、公開版では実ファイルを配置。
+  // PDL1.0 の加工表示: GLB は PLATEAU 3D Tiles を加工 (抽出・変換) して作成したものである
+  // 旨をクレジットにも明記する。
+  document.getElementById("credit").textContent += " / 建物GLBは PLATEAU 3D Tiles を加工して作成";
+  const MODEL_BASE = "models/";
+  fetch(MODEL_BASE + "manifest.json").then(r => {
+    if (!r.ok) throw new Error("manifest HTTP " + r.status);
+    return r.json();
+  }).then(names => {
+    modelsTotal = names.length;
+    return Promise.all(names.map(n =>
+      Cesium.Model.fromGltfAsync({ url: MODEL_BASE + n, modelMatrix: Cesium.Matrix4.IDENTITY })
+        .then(m => { viewer.scene.primitives.add(m); modelsLoaded++; viewer.scene.requestRender(); })
+        .catch(e => { modelsFailed++; console.log("model failed " + n + ": " + e); })
+    ));
+  }).then(() => {
+    if (modelsLoaded > 0) { applyP(dispP, true); return; }
+    throw new Error("all models failed (" + modelsFailed + ")");
+  }).catch(e => {
+    // フォールバック: GLB が配信されていない環境 (公開版で models/ 未配置の間など) では
+    // 建物が全く出ない状態を避け、tileset 経路に倒す。モバイル既定が model でも
+    // ページが成立するための安全弁であり、方式判断そのものは変えない (README 参照)。
+    modelsError = String(e);
+    modelFallback = true;
+    console.log("model path unavailable, falling back to tileset: " + modelsError);
+    startTileset();
+  });
+}
+if (RENDERER === "model") startModels(); else startTileset();
 
 // ---- Camera paths: real coordinates (WGS84), heights in metres ----
 // t(s), camLon, camLat, camH, lookLon, lookLat, lookH, captionEN, captionJA
@@ -650,16 +704,20 @@ function processingNow() {
   if (tileset && tileset.statistics) return tileset.statistics.numberOfTilesProcessing;
   return -1;
 }
-window.__ready = () => RENDERER === "model"
-  ? (modelsTotal > 0 && modelsLoaded + modelsFailed >= modelsTotal && modelsLoaded > 0)
-  : (!!tileset && tileset.tilesLoaded && pendingNow() <= 0);
+window.__ready = () => tileset
+  ? (tileset.tilesLoaded && pendingNow() <= 0)
+  : (RENDERER === "model" && modelsTotal > 0 && modelsLoaded + modelsFailed >= modelsTotal && modelsLoaded > 0);
 window.__getState = () => ({
   route: ROUTE_ID, grade: GRADE_ID, renderer: RENDERER, heightfix: HEIGHTFIX,
   terrain: TERRAIN,
   profile: {
     mobile: MOBILE, mobileAuto: MOBILE_AUTO, sse: TILESET_SSE,
     resolutionScale: viewer.resolutionScale, globeSSE: viewer.scene.globe.maximumScreenSpaceError,
-    hmSize: HM_SIZE, demCacheCap: DEM_CACHE_CAP, tilesetCacheBytes: TILESET_CACHE_BYTES
+    globeTileCacheSize: viewer.scene.globe.tileCacheSize,
+    hmSize: HM_SIZE, demCacheCap: DEM_CACHE_CAP, tilesetCacheBytes: TILESET_CACHE_BYTES,
+    requestScheduler: { max: Cesium.RequestScheduler.maximumRequests, perServer: Cesium.RequestScheduler.maximumRequestsPerServer },
+    rendererParam: RENDERER_PARAM, terrainRequested: TERRAIN_REQ, demForce: DEM_FORCE, demSuppressed: DEM_SUPPRESSED,
+    modelFallback
   },
   demStats: TERRAIN === "dem" ? { ...demStats, cacheSize: demTileCache.size } : null,
   gradeState: {
