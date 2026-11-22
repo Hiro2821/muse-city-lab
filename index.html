@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SENDAI — Real Data Scroll Prototype v0 (Cesium + PLATEAU)</title>
+<!--
+  Muse City Lab / sendai-scroll v0 (publish 版: GitHub Pages 配信用。Cesium 本体は jsDelivr CDN から読み込む)
+  土台: ~/workspace/sendai-real/index.html (Cesium 初期化・KEYS・Catmull-Rom・夕方太陽光を流用)
+  差分: 時間再生ではなく本編準拠のスクロール駆動 (600svh track + sticky stage,
+        p = clamp(-top/(trackH-stageH)), follow rate 6.5 + max 0.07/150ms,
+        t = min(1, p/0.94) * DURATION, キャプションは p の純関数)
+  クエリ:
+    ?route=v1|v2     v1=既存 KEYS 踏襲 (default) / v2=街路レベル 5-10m キー追加
+    ?grade=day|dusk|night  演出プリセット (default dusk)。太陽時刻 (JulianDate) を正とし、
+                     大気散乱・霧・画像レイヤ brightness 等をプリセットごとに制御する (下記 GRADES)。
+    ?lights=on       窓明かり点群レイヤ (夜の重ね物の試作、本採用ではない到達度検証用)。
+                     建物位置には整合していないプロシージャル配置。default off
+    ?render=rrm|loop rrm=requestRenderMode (default) / loop=常時描画
+    ?tiles=direct|proxy    direct=PLATEAU https 直接 (正, default) / proxy=ローカル server.mjs 経由 (VM 検証用)
+    ?renderer=tileset|model tileset=Cesium3DTileset (default) / model=メイン側が抽出した
+                     24枚の GLB を Cesium.Model で個別読み (sendai-real/models へのシンボリックリンク経由、
+                     modelMatrix=IDENTITY)。tileset 描画経路の代替検証用。
+    ?terrain=ellipsoid|dem ellipsoid=楕円体地形 (default、従来挙動) / dem=国土地理院 標高タイル
+                     (dem_png) を CustomHeightmapTerrainProvider で読む地形 (到達度検証用、本採用ではない)。
+                     dem_png は標高 (ジオイド基準) の PNG エンコーディング (公式仕様: x=2^16*R+2^8*G+B、
+                     x<2^23 で h=x*0.01m、x=2^23 が無効値、x>2^23 で h=(x-2^24)*0.01m、提供は z14 まで)。
+                     Cesium の地形高は楕円体高のため、標高にジオイド高 +40.67m (heightfix の較正値) を
+                     加算して整合させる。z15 以上は z14 タイルを細分してサンプルする。
+    ?heightfix=on|off on=カメラ高度の基準面補正 (default)。KEYS の camH/lookH は対地高度のまま、
+                     地点ごとの基盤楕円体高 (BASE_V1/BASE_V2) を加算して楕円体高へ変換する。
+                     off=補正なし (従来挙動の再現用)。
+                     基盤高の求め方: GSI 1mレーザ DEM の標高 (地点ごと) + ジオイド高 40.67m。
+                     ジオイド高は PLATEAU 実ジオメトリ (b3dm を Draco 復号し頂点の最低高度を実測) と
+                     DEM の差の中央値 (n=25, 市街地, 標準偏差 0.54m) で較正。詳細は README と
+                     tools/measure_base.py / tools/base-measure.json を参照。
+    ?debug=1         デバッグ表示
+  検証窓口: window.__setP(p) / window.__ready() / window.__getState()
+-->
+<script>window.CESIUM_BASE_URL = "https://cdn.jsdelivr.net/npm/cesium@1.124.0/Build/Cesium/";</script>
+<script src="https://cdn.jsdelivr.net/npm/cesium@1.124.0/Build/Cesium/Cesium.js"></script>
+<link href="https://cdn.jsdelivr.net/npm/cesium@1.124.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<style>
+  html, body { margin:0; padding:0; background:#000; }
+  #track { height:600svh; position:relative; }
+  #stage { position:sticky; top:0; height:100svh; overflow:hidden; }
+  #cesiumContainer { position:absolute; inset:0; }
+  .cesium-viewer-bottom, .cesium-viewer-toolbar, .cesium-viewer-animationContainer,
+  .cesium-viewer-timelineContainer, .cesium-viewer-fullscreenContainer { display:none !important; }
+  #caption {
+    position:absolute; left:32px; bottom:36px; color:#fff; pointer-events:none; z-index:5;
+    font-family:"Hiragino Mincho ProN","Yu Mincho",serif; text-shadow:0 1px 8px rgba(0,0,0,.8);
+    opacity:0; transition:opacity .6s;
+  }
+  #caption .en { font-size:30px; letter-spacing:.35em; }
+  #caption .ja { font-size:15px; letter-spacing:.5em; margin-top:6px; opacity:.85; }
+  #hint {
+    position:absolute; left:50%; bottom:14px; transform:translateX(-50%); z-index:5;
+    color:rgba(255,255,255,.75); font:12px/1 sans-serif; letter-spacing:.3em; pointer-events:none;
+    text-shadow:0 1px 6px rgba(0,0,0,.9); transition:opacity .8s;
+  }
+  #credit {
+    position:absolute; right:8px; bottom:6px; z-index:5; pointer-events:none;
+    color:rgba(255,255,255,.55); font:10px/1.4 sans-serif; text-shadow:0 1px 4px rgba(0,0,0,.9);
+  }
+  #debug {
+    position:absolute; top:10px; left:10px; color:#9f9; background:rgba(0,0,0,.55); z-index:6;
+    font:12px/1.6 monospace; padding:6px 10px; border-radius:6px; white-space:pre; display:none;
+  }
+  #status {
+    position:absolute; top:10px; right:10px; color:#fc9; background:rgba(0,0,0,.45); z-index:6;
+    font:11px/1.5 monospace; padding:4px 8px; border-radius:6px; white-space:pre; display:none;
+  }
+</style>
+</head>
+<body>
+<div id="track">
+  <div id="stage">
+    <div id="cesiumContainer"></div>
+    <div id="caption"><div class="en"></div><div class="ja"></div></div>
+    <div id="hint">SCROLL</div>
+    <div id="credit">出典: 国土交通省 Project PLATEAU — 仙台市 3D都市モデル (2024年度・青葉区 LOD2) / PLATEAU-Ortho 2023</div>
+    <div id="debug">init…</div>
+    <div id="status"></div>
+  </div>
+</div>
+<script>
+"use strict";
+Cesium.Ion.defaultAccessToken = ""; // no ion assets used
+
+const Q = new URLSearchParams(location.search);
+const ROUTE_ID = Q.get("route") === "v2" ? "v2" : "v1";
+const GRADE_ID = ["day", "dusk", "night"].includes(Q.get("grade")) ? Q.get("grade") : "dusk";
+const RENDER_LOOP = Q.get("render") === "loop";
+const RENDERER = Q.get("renderer") === "model" ? "model" : "tileset";
+const TILES_PROXY = Q.get("tiles") === "proxy";
+const HEIGHTFIX = Q.get("heightfix") !== "off"; // default on
+const TERRAIN = Q.get("terrain") === "dem" ? "dem" : "ellipsoid"; // 地形プロバイダ切替 (検証用)
+const LIGHTS = Q.get("lights") === "on"; // 窓明かり点群 (試作レイヤ)
+const DEBUG = Q.get("debug") === "1";
+
+// ---- Data sources: direct https is canonical; /remote/ proxy only for local VM verification ----
+const PLATEAU_HOST = "assets.cms.plateau.reearth.io";
+const TILESET_PATH = "/assets/29/10aacf-3830-4ded-8adc-f58ecc71772e/04100_sendai-shi_city_2024_citygml_1_op_bldg_3dtiles_04101_aoba-ku_lod2/tileset.json";
+const ORTHO_HOST = "tile.plateauview.mlit.go.jp";
+const TILESET_URL = TILES_PROXY ? "/remote/" + PLATEAU_HOST + TILESET_PATH
+                                : "https://" + PLATEAU_HOST + TILESET_PATH;
+const ORTHO_URL = TILES_PROXY ? "/remote/" + ORTHO_HOST + "/tiles/plateau-ortho-2023/{z}/{x}/{y}.png"
+                              : "https://" + ORTHO_HOST + "/tiles/plateau-ortho-2023/{z}/{x}/{y}.png";
+
+// ---- 地形 (?terrain=dem): 国土地理院 標高タイル dem_png → CustomHeightmapTerrainProvider ----
+// dem_png 仕様 (地理院公式「標高タイルの詳細仕様」): 256x256 PNG、x = 2^16*R + 2^8*G + B とし、
+//   x < 2^23: h = x * 0.01m / x = 2^23: 無効値 (RGB 128,0,0) / x > 2^23: h = (x - 2^24) * 0.01m。
+//   提供ズームは z14 まで (z15 は 404 を実測)。データ源は基盤地図情報 10m メッシュ相当。
+// 標高はジオイド基準 (標高) で、Cesium の地形高は楕円体高。差はジオイド高で、仙台市街地では
+// +40.67m (heightfix 較正: PLATEAU 実ジオメトリ足元 − GSI 1m DEM、n=25 中央値、README 参照)。
+// よって 地形の楕円体高 = dem_png 標高 + 40.67 とする。カメラ側 (heightfix) も同じ較正で
+// 楕円体高化しているため、二重加算にはならない (検証で数値確認する)。
+// 無効値ピクセル (海上等) は楕円体高 0m とし、取得失敗タイルは全 0 (楕円体) で代替する。
+const DEM_HOST = "cyberjapandata.gsi.go.jp";
+const DEM_MAX_LEVEL = 14;
+const GEOID_H = 40.67; // 仙台市街地のジオイド高 (heightfix 較正値)
+const DEM_URL = (z, x, y) => TILES_PROXY
+  ? "/remote/" + DEM_HOST + "/xyz/dem_png/" + z + "/" + x + "/" + y + ".png"
+  : "https://" + DEM_HOST + "/xyz/dem_png/" + z + "/" + x + "/" + y + ".png";
+const demStats = { fetches: 0, fetchBytes: 0, failures: 0, tilesDecoded: 0 };
+const demTileCache = new Map(); // "z/x/y" -> Promise<Float32Array(256*256) | null> 標高 (m、無効値は NaN)
+function loadDemTile(z, x, y) {
+  const key = z + "/" + x + "/" + y;
+  if (demTileCache.has(key)) return demTileCache.get(key);
+  const promise = (async () => {
+    try {
+      demStats.fetches++;
+      const res = await fetch(DEM_URL(z, x, y));
+      if (!res.ok) { demStats.failures++; return null; }
+      const blob = await res.blob();
+      demStats.fetchBytes += blob.size;
+      const bmp = await createImageBitmap(blob);
+      const cv = document.createElement("canvas");
+      cv.width = 256; cv.height = 256;
+      const ctx = cv.getContext("2d", { willReadFrequently: true });
+      ctx.drawImage(bmp, 0, 0, 256, 256);
+      const img = ctx.getImageData(0, 0, 256, 256).data;
+      const out = new Float32Array(256 * 256);
+      for (let i = 0; i < 256 * 256; i++) {
+        const xv = img[i * 4] * 65536 + img[i * 4 + 1] * 256 + img[i * 4 + 2];
+        out[i] = xv === 8388608 ? NaN : (xv < 8388608 ? xv * 0.01 : (xv - 16777216) * 0.01);
+      }
+      demStats.tilesDecoded++;
+      return out;
+    } catch (e) { demStats.failures++; return null; }
+  })();
+  demTileCache.set(key, promise);
+  return promise;
+}
+// 標高タイル (256px) から任意地点の標高を双線形補間で引く。px はタイル内ピクセル座標 (中心基準)。
+function demSampleBilinear(data, px, py) {
+  const x0 = Math.max(0, Math.min(254, Math.floor(px))), y0 = Math.max(0, Math.min(254, Math.floor(py)));
+  const fx = Math.max(0, Math.min(1, px - x0)), fy = Math.max(0, Math.min(1, py - y0));
+  let sum = 0, wsum = 0;
+  const corners = [[x0, y0, (1 - fx) * (1 - fy)], [x0 + 1, y0, fx * (1 - fy)], [x0, y0 + 1, (1 - fx) * fy], [x0 + 1, y0 + 1, fx * fy]];
+  for (const [cx, cy, w] of corners) {
+    const v = data[cy * 256 + cx];
+    if (Number.isFinite(v) && w > 0) { sum += v * w; wsum += w; }
+  }
+  return wsum > 0 ? sum / wsum : NaN;
+}
+const HM_W = 65, HM_H = 65; // heightmap のサンプル数 (タイル辺あたり)
+async function demHeights(x, y, level) {
+  const out = new Float32Array(HM_W * HM_H); // 既定 0 = 楕円体 (取得失敗・無効値の代替)
+  const srcLevel = Math.min(level, DEM_MAX_LEVEL);
+  const scale = Math.pow(2, level - srcLevel); // 要求タイルが元タイルの 1/scale の大きさ
+  const sx = Math.floor(x / scale), sy = Math.floor(y / scale);
+  const data = await loadDemTile(srcLevel, sx, sy);
+  if (!data) return out;
+  const subX = x - sx * scale, subY = y - sy * scale; // 元タイル内での要求タイルの位置 (タイル単位)
+  for (let row = 0; row < HM_H; row++) {
+    const v = row / (HM_H - 1); // 0=北端 → 1=南端 (HeightmapTerrainData は北→南の行順)
+    for (let col = 0; col < HM_W; col++) {
+      const u = col / (HM_W - 1); // 0=西端 → 1=東端
+      // 要求タイル内の正規化座標 → 元タイルのピクセル座標 (ピクセル中心が整数座標)
+      const px = ((subX + u) / scale) * 256 - 0.5;
+      const py = ((subY + v) / scale) * 256 - 0.5;
+      const elev = demSampleBilinear(data, px, py);
+      out[row * HM_W + col] = Number.isFinite(elev) ? elev + GEOID_H : 0;
+    }
+  }
+  return out;
+}
+function makeDemTerrainProvider() {
+  return new Cesium.CustomHeightmapTerrainProvider({
+    width: HM_W, height: HM_H,
+    tilingScheme: new Cesium.WebMercatorTilingScheme(),
+    credit: "国土地理院 標高タイル (dem_png)",
+    callback: (x, y, level) => demHeights(x, y, level)
+  });
+}
+// 検証用: 任意地点の dem_png 標高と楕円体高換算を返す (二重加算チェックに使う)
+window.__demHeightAt = async (lon, lat) => {
+  const z = DEM_MAX_LEVEL, n = Math.pow(2, z);
+  const fx = (lon + 180) / 360 * n;
+  const fy = (1 - Math.log(Math.tan(Cesium.Math.toRadians(lat)) + 1 / Math.cos(Cesium.Math.toRadians(lat))) / Math.PI) / 2 * n;
+  const tx = Math.floor(fx), ty = Math.floor(fy);
+  const data = await loadDemTile(z, tx, ty);
+  if (!data) return { lon, lat, elev: null, ellipsoidal: null };
+  const elev = demSampleBilinear(data, (fx - tx) * 256 - 0.5, (fy - ty) * 256 - 0.5);
+  return { lon, lat, elev: Number.isFinite(elev) ? +elev.toFixed(2) : null,
+           ellipsoidal: Number.isFinite(elev) ? +(elev + GEOID_H).toFixed(2) : null, geoid: GEOID_H };
+};
+
+const viewer = new Cesium.Viewer("cesiumContainer", {
+  // baseLayer は遅延追加する: Viewer 生成直後の初期フレーム (既定カメラ=地球全体) で
+  // minimumLevel 10 のオルソ要求が氾濫し、遅い回線では tileset.json の取得を starve させるため。
+  baseLayer: false,
+  terrainProvider: TERRAIN === "dem" ? makeDemTerrainProvider() : new Cesium.EllipsoidTerrainProvider(),
+  animation: false, timeline: false, baseLayerPicker: false,
+  geocoder: false, homeButton: false, sceneModePicker: false,
+  navigationHelpButton: false, fullscreenButton: false,
+  requestRenderMode: !RENDER_LOOP, maximumRenderTimeChange: Infinity
+});
+
+// ---- Grade presets (本格版, 2026-11-22 夜・夕方再構成の検証で実装) ----
+// 方針: 太陽位置は viewer.clock の JulianDate を正とし、Cesium の大気散乱
+// (SkyAtmosphere + globe の dynamicAtmosphereLightingFromSun) に空の色を作らせる。
+// その上で (1) SunLight の色/強さ、(2) Fog の密度/色、(3) SkyAtmosphere の
+// hue/saturation/brightness shift、(4) 画像レイヤ (オルソ) の brightness/contrast/
+// saturation/gamma、(5) tileset の imageBasedLightingFactor (環境光の効き) を
+// プリセットごとに調整し、昼テクスチャをどこまで落とせるかを測る。
+// 時刻は 2026-08-05 仙台: day=12:00 JST / dusk=17:20 JST (sendai-real 踏襲) /
+// night=19:30 JST (日没 約18:40 の約50分後、太陽高度は負 = 薄明〜夜)。
+const GRADES = {
+  day: {
+    sunUTC: [2026, 7, 5, 3, 0],                    // 12:00 JST
+    light: "#ffffff", intensity: 2.2,
+    fogDensity: 0.00006, fogColor: "#bfd6ea",
+    atmo: { hue: 0.0, sat: 0.0, bri: 0.0 },
+    imagery: { brightness: 1.0, contrast: 1.0, saturation: 1.0, gamma: 1.0 },
+    ibl: [1.0, 1.0], globe: "#1a2432", bg: "#6f9fd0"
+  },
+  dusk: {
+    sunUTC: [2026, 7, 5, 8, 20],                   // 17:20 JST
+    light: "#ffb37a", intensity: 1.35,
+    fogDensity: 0.00014, fogColor: "#c99a68",
+    atmo: { hue: -0.04, sat: 0.08, bri: -0.12 },
+    imagery: { brightness: 0.72, contrast: 1.05, saturation: 0.95, gamma: 0.95 },
+    ibl: [0.7, 0.7], globe: "#141a24", bg: "#2c3e57"
+  },
+  night: {
+    sunUTC: [2026, 7, 5, 10, 30],                  // 19:30 JST
+    light: "#7d92c4", intensity: 0.22,             // 月明かり的な弱い青い fill
+    fogDensity: 0.00020, fogColor: "#0a1220",
+    atmo: { hue: 0.0, sat: -0.25, bri: -0.55 },
+    imagery: { brightness: 0.16, contrast: 1.05, saturation: 0.55, gamma: 1.0 },
+    ibl: [0.22, 0.22], globe: "#04060a", bg: "#020409"
+  }
+};
+const G = GRADES[GRADE_ID];
+viewer.scene.backgroundColor = Cesium.Color.fromCssColorString(G.bg);
+viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString(G.globe);
+viewer.scene.globe.showGroundAtmosphere = true;
+if ("dynamicAtmosphereLightingFromSun" in viewer.scene.globe) {
+  viewer.scene.globe.dynamicAtmosphereLightingFromSun = true; // 大気を太陽時刻に追従させる
+}
+viewer.scene.skyAtmosphere.show = true;
+viewer.scene.skyAtmosphere.hueShift = G.atmo.hue;
+viewer.scene.skyAtmosphere.saturationShift = G.atmo.sat;
+viewer.scene.skyAtmosphere.brightnessShift = G.atmo.bri;
+viewer.scene.fog.enabled = true;
+viewer.scene.fog.density = G.fogDensity;
+if ("color" in viewer.scene.fog) viewer.scene.fog.color = Cesium.Color.fromCssColorString(G.fogColor);
+viewer.clock.currentTime = Cesium.JulianDate.fromDate(new Date(Date.UTC(...G.sunUTC)));
+viewer.scene.light = new Cesium.SunLight({
+  color: Cesium.Color.fromCssColorString(G.light), intensity: G.intensity
+});
+function applyImageryGrade(layer) {
+  if (!layer) return;
+  layer.brightness = G.imagery.brightness;
+  layer.contrast = G.imagery.contrast;
+  layer.saturation = G.imagery.saturation;
+  layer.gamma = G.imagery.gamma;
+}
+function applyTilesetGrade(ts) {
+  if (!ts) return;
+  // PBR タイルへの環境光 (IBL) の効きを落とす。直射は SunLight 側で制御済み。
+  try { ts.imageBasedLightingFactor = new Cesium.Cartesian2(G.ibl[0], G.ibl[1]); } catch (e) { /* 未対応環境では無視 */ }
+}
+
+// ---- 窓明かり点群レイヤ (?lights=on、夜の重ね物の試作。本採用ではない) ----
+// 建物テクスチャには手を入れず、発光点だけを重ねて「夜らしさ」がどこまで作れるかを見る。
+// 限界 (先に明記): 点の水平位置は建物 footprint に整合していない (繁華街への
+// クラスタ＋一様分布のプロシージャル配置)。高さは市街地の基盤楕円体高 (概ね 74〜88m)
+// に建物高相当のランダム分を加えたもの。建物の陰になる点は depth test で隠れるが、
+// 通りや空地の上に浮く点も混ざる。到達度の目安を見るための試作である。
+let lightsCount = 0;
+if (LIGHTS) {
+  let seed = 20260805;
+  const rand = () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0; let z = Math.imul(seed ^ (seed >>> 15), 1 | seed); z = (z + Math.imul(z ^ (z >>> 7), 61 | z)) ^ z; return ((z ^ (z >>> 14)) >>> 0) / 4294967296; };
+  const clusters = [ // [lon, lat, spreadLon, spreadLat, weight] 仙台駅 / 一番町 / 定禅寺通・青葉通
+    [140.8815, 38.2595, 0.0028, 0.0022, 0.34],
+    [140.8712, 38.2612, 0.0016, 0.0032, 0.30],
+    [140.8725, 38.2625, 0.0055, 0.0026, 0.22],
+    [140.8740, 38.2565, 0.0090, 0.0060, 0.14]  // 市街地一様寄り
+  ];
+  const pts = new Cesium.PointPrimitiveCollection({ blendingState: Cesium.BlendingState.ADDITIVE });
+  const palette = ["#ffd9a0", "#ffe9c4", "#fff3d6", "#ffc98a", "#b9d2ff"];
+  const N = 4200;
+  for (let i = 0; i < N; i++) {
+    let c = clusters[0], r = rand(), acc = 0;
+    for (const cl of clusters) { acc += cl[4]; if (r <= acc) { c = cl; break; } }
+    const lon = c[0] + (rand() * 2 - 1) * c[2];
+    const lat = c[1] + (rand() * 2 - 1) * c[3];
+    const h = 76 + rand() * 10 + Math.pow(rand(), 2.2) * 78; // 基盤 + 建物高相当
+    pts.add({
+      position: Cesium.Cartesian3.fromDegrees(lon, lat, h),
+      color: Cesium.Color.fromCssColorString(palette[Math.floor(rand() * palette.length)]),
+      pixelSize: rand() < 0.12 ? 3 : 2
+    });
+    lightsCount++;
+  }
+  viewer.scene.primitives.add(pts);
+}
+
+if (TERRAIN === "dem") {
+  document.getElementById("credit").textContent += " / 標高: 国土地理院 標高タイル (dem_png、ジオイド補正 +40.67m)";
+}
+const statusEl = document.getElementById("status");
+const debugEl = document.getElementById("debug");
+if (DEBUG) debugEl.style.display = "block";
+let tileset = null;
+let statPending = -1, statProcessing = -1; // from tileLoadProgressEvent
+let tilesetError = "";
+let modelsTotal = 0, modelsLoaded = 0, modelsFailed = 0, modelsError = "";
+if (RENDERER === "model") {
+  // 代替経路: メイン側 (sendai-real) が PLATEAU のリーフタイル .b3dm から抽出した GLB 24枚を
+  // Cesium.Model で個別に読む。GLB 側に実座標が焼き込まれているため modelMatrix は IDENTITY
+  // (メイン側 index.html の実績方式を踏襲)。配信は sendai-scroll/models -> sendai-real/models の symlink。
+  fetch("/models/manifest.json").then(r => r.json()).then(names => {
+    modelsTotal = names.length;
+    return Promise.all(names.map(n =>
+      Cesium.Model.fromGltfAsync({ url: "/models/" + n, modelMatrix: Cesium.Matrix4.IDENTITY })
+        .then(m => { viewer.scene.primitives.add(m); modelsLoaded++; viewer.scene.requestRender(); })
+        .catch(e => { modelsFailed++; console.log("model failed " + n + ": " + e); })
+    ));
+  }).then(() => { applyP(dispP, true); })
+    .catch(e => {
+      modelsError = String(e);
+      statusEl.style.display = "block";
+      statusEl.textContent = "model manifest error: " + modelsError;
+    });
+} else {
+  Cesium.Cesium3DTileset.fromUrl(TILESET_URL, {
+    maximumScreenSpaceError: 16
+  }).then(ts => {
+    tileset = ts;
+    viewer.scene.primitives.add(ts);
+    applyTilesetGrade(ts);
+    // Cesium 1.124: イベント名は loadProgress (旧 tileLoadProgressEvent は Globe 側のみ)
+    if (ts.loadProgress) {
+      ts.loadProgress.addEventListener((pending, processing) => {
+        statPending = pending; statProcessing = processing;
+        viewer.scene.requestRender();
+      });
+    }
+    applyP(dispP, true);
+  }).catch(e => {
+    tilesetError = String(e);
+    statusEl.style.display = "block";
+    statusEl.textContent = "tileset error: " + tilesetError;
+  });
+}
+
+// ---- Camera paths: real coordinates (WGS84), heights in metres ----
+// t(s), camLon, camLat, camH, lookLon, lookLat, lookH, captionEN, captionJA
+const KEYS_V1 = [ // sendai-real 踏襲: 仙台駅 -> 青葉通 -> 定禅寺通 -> 一番町 -> 青葉城址
+  [ 0.0, 140.8845, 38.2560, 260, 140.8810, 38.2600, 30, "SENDAI", "仙台駅"],
+  [ 6.0, 140.8810, 38.2598, 120, 140.8765, 38.2598, 20, "", ""],
+  [12.0, 140.8768, 38.2598,  45, 140.8700, 38.2598, 15, "AOBA-DORI", "青葉通"],
+  [18.0, 140.8705, 38.2610,  60, 140.8718, 38.2650, 15, "", ""],
+  [24.0, 140.8718, 38.2648,  35, 140.8680, 38.2648, 12, "JOZENJI-DORI", "定禅寺通"],
+  [30.0, 140.8685, 38.2648,  55, 140.8710, 38.2610, 15, "", ""],
+  [36.0, 140.8712, 38.2618,  30, 140.8712, 38.2580, 12, "ICHIBANCHO", "一番町"],
+  [42.0, 140.8690, 38.2570, 150, 140.8580, 38.2530, 60, "", ""],
+  [48.0, 140.8568, 38.2528, 190, 140.8750, 38.2590, 20, "FROM AOBA CASTLE RUINS", "青葉城址から"],
+  [54.0, 140.8568, 38.2528, 190, 140.8780, 38.2595, 15, "", ""]
+];
+const KEYS_V2 = [ // v1 + 街路レベル (camH 5-10m) キー追加: 青葉通 t=9 / 定禅寺通 t=21 / 一番町 t=33,38
+  [ 0.0, 140.8845, 38.2560, 260, 140.8810, 38.2600, 30, "SENDAI", "仙台駅"],
+  [ 6.0, 140.8810, 38.2598, 120, 140.8765, 38.2598, 20, "", ""],
+  [ 9.0, 140.8788, 38.2598,   8, 140.8740, 38.2598,  6, "", ""], // 青葉通 街路 8m
+  [12.0, 140.8768, 38.2598,  45, 140.8700, 38.2598, 15, "AOBA-DORI", "青葉通"],
+  [18.0, 140.8705, 38.2610,  60, 140.8718, 38.2650, 15, "", ""],
+  [21.0, 140.8702, 38.2648,   7, 140.8660, 38.2648, 10, "", ""], // 定禅寺通 街路 7m
+  [24.0, 140.8718, 38.2648,  35, 140.8680, 38.2648, 12, "JOZENJI-DORI", "定禅寺通"],
+  [30.0, 140.8685, 38.2648,  55, 140.8710, 38.2610, 15, "", ""],
+  [33.0, 140.8712, 38.2632,   6, 140.8712, 38.2595,  8, "", ""], // 一番町 街路 6m
+  [36.0, 140.8712, 38.2618,  30, 140.8712, 38.2580, 12, "ICHIBANCHO", "一番町"],
+  [38.0, 140.8712, 38.2600,   6, 140.8712, 38.2575, 10, "", ""], // 一番町 南端 街路 6m
+  [42.0, 140.8690, 38.2570, 150, 140.8580, 38.2530, 60, "", ""],
+  [48.0, 140.8568, 38.2528, 190, 140.8750, 38.2590, 20, "FROM AOBA CASTLE RUINS", "青葉城址から"],
+  [54.0, 140.8568, 38.2528, 190, 140.8780, 38.2595, 15, "", ""]
+];
+const KEYS_RAW = ROUTE_ID === "v2" ? KEYS_V2 : KEYS_V1;
+
+// ---- 基盤楕円体高テーブル (KEYS と同じ並び、[camBase, lookBase]、単位 m) ----
+// 基盤高 = GSI 1mレーザ DEM 標高 (各キー地点で取得) + ジオイド高 40.67m。
+// ジオイド高の較正: PLATEAU b3dm 全45ファイルを Draco 復号し、各地点 60m 圏内の頂点の
+// 最低楕円体高 (建物の足元) を実測、DEM との差を市街地 25 地点で取ると中央値 40.67m /
+// 標準偏差 0.54m / 範囲 39.08〜41.31m。予測と実測足元の残差は概ね ±1.2m 以内 (最大 +1.59m)。
+// tileset region の minH を使う方法は棄却した: タイルが約1km四方で、青葉城址を含む
+// タイルの minH は 64.95m (広瀬川沿いの最低点) で実基盤 約156m と 91m ずれるため。
+// 計測の再現手順と生データ: tools/measure_base.py / tools/base-measure.json。
+const BASE_V1 = [ // dem: cam/look の標高 (GSI)
+  [ 72.47,  76.07], // t=0   dem 31.8 / 35.4
+  [ 76.07,  77.37], // t=6   dem 35.4 / 36.7
+  [ 77.17,  82.97], // t=12  dem 36.5 / 42.3
+  [ 83.17,  83.67], // t=18  dem 42.5 / 43.0
+  [ 83.77,  85.07], // t=24  dem 43.1 / 44.4
+  [ 85.67,  83.37], // t=30  dem 45.0 / 42.7
+  [ 82.97,  79.27], // t=36  dem 42.3 / 38.6
+  [ 80.37,  78.37], // t=42  dem 39.7 / 37.7
+  [155.87,  78.27], // t=48  dem 115.2 / 37.6 (cam は青葉城址の丘)
+  [155.87,  76.47]  // t=54  dem 115.2 / 35.8
+];
+const BASE_V2 = [
+  [ 72.47,  76.07], // t=0   dem 31.8 / 35.4
+  [ 76.07,  77.37], // t=6   dem 35.4 / 36.7
+  [ 75.97,  78.77], // t=9   dem 35.3 / 38.1 (青葉通 街路)
+  [ 77.17,  82.97], // t=12  dem 36.5 / 42.3
+  [ 83.17,  83.67], // t=18  dem 42.5 / 43.0
+  [ 84.67,  85.77], // t=21  dem 44.0 / 45.1 (定禅寺通 街路)
+  [ 83.77,  85.07], // t=24  dem 43.1 / 44.4
+  [ 85.67,  83.37], // t=30  dem 45.0 / 42.7
+  [ 82.87,  81.57], // t=33  dem 42.2 / 40.9 (一番町 街路)
+  [ 82.97,  79.27], // t=36  dem 42.3 / 38.6
+  [ 82.67,  78.47], // t=38  dem 42.0 / 37.8 (一番町南端 街路)
+  [ 80.37,  78.37], // t=42  dem 39.7 / 37.7
+  [155.87,  78.27], // t=48  dem 115.2 / 37.6
+  [155.87,  76.47]  // t=54  dem 115.2 / 35.8
+];
+const BASES = ROUTE_ID === "v2" ? BASE_V2 : BASE_V1;
+// KEYS の camH/lookH は「対地高度」の意味のまま保持し、ここで基盤高を加算して
+// 楕円体高へ変換したものを実効キーとする。Catmull-Rom は線形補間のため、
+// キー側で加算してから補間することと、補間後に基盤高 (同じ重みで補間) を加算することは等価。
+const KEYS = HEIGHTFIX
+  ? KEYS_RAW.map((k, i) => [k[0], k[1], k[2], k[3] + BASES[i][0], k[4], k[5], k[6] + BASES[i][1], k[7], k[8]])
+  : KEYS_RAW;
+const DURATION = KEYS[KEYS.length - 1][0]; // 54
+
+function catmullRom(p0, p1, p2, p3, t) {
+  const t2 = t * t, t3 = t2 * t;
+  return 0.5 * ((2 * p1) + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+}
+function sample(t) {
+  t = Math.max(0, Math.min(DURATION, t));
+  let i = 0;
+  while (i < KEYS.length - 2 && t > KEYS[i + 1][0]) i++;
+  const k1 = KEYS[i], k2 = KEYS[i + 1];
+  const k0 = KEYS[Math.max(0, i - 1)], k3 = KEYS[Math.min(KEYS.length - 1, i + 2)];
+  const f = (t - k1[0]) / (k2[0] - k1[0]);
+  const out = [];
+  for (let c = 1; c <= 6; c++) out.push(catmullRom(k0[c], k1[c], k2[c], k3[c], f));
+  // 基盤高も同じキー区間・同じ重みで補間する (検証窓口とデバッグ表示用)
+  const b1 = BASES[i], b2 = BASES[i + 1];
+  const b0 = BASES[Math.max(0, i - 1)], b3 = BASES[Math.min(KEYS.length - 1, i + 2)];
+  const baseCam = HEIGHTFIX ? catmullRom(b0[0], b1[0], b2[0], b3[0], f) : 0;
+  const baseLook = HEIGHTFIX ? catmullRom(b0[1], b1[1], b2[1], b3[1], f) : 0;
+  let cap = ["", ""];
+  for (const k of KEYS) { if (k[0] <= t && (k[7] || k[8])) cap = [k[7], k[8]]; if (k[0] > t) break; }
+  return { cam: out.slice(0, 3), look: out.slice(3, 6), cap, baseCam, baseLook };
+}
+
+// ---- Scroll drive (本編準拠の写像; 本編 math.js 相当を再実装) ----
+const track = document.getElementById("track");
+const stage = document.getElementById("stage");
+const captionEl = document.getElementById("caption");
+const hintEl = document.getElementById("hint");
+const clamp01 = v => Math.max(0, Math.min(1, v));
+
+function scrollTargetP() {
+  const trackH = track.offsetHeight, stageH = stage.clientHeight;
+  const denom = trackH - stageH;
+  if (denom <= 0) return 0;
+  return clamp01(-track.getBoundingClientRect().top / denom);
+}
+
+let targetP = scrollTargetP();
+let dispP = targetP;
+let overrideP = null; // __setP によるプログラム指定中はスクロールより優先
+window.addEventListener("scroll", () => {
+  if (overrideP === null) targetP = scrollTargetP();
+}, { passive: true });
+window.addEventListener("resize", () => {
+  if (overrideP === null) targetP = scrollTargetP();
+  viewer.scene.requestRender();
+});
+
+let lastSample = null; // __getState / デバッグ表示用 (直近の sample 結果)
+function applyP(p, force) {
+  const t = Math.min(1, p / 0.94) * DURATION;
+  const s = sample(t);
+  lastSample = s;
+  const camPos = Cesium.Cartesian3.fromDegrees(s.cam[0], s.cam[1], s.cam[2]);
+  const lookPos = Cesium.Cartesian3.fromDegrees(s.look[0], s.look[1], s.look[2]);
+  const dir = Cesium.Cartesian3.subtract(lookPos, camPos, new Cesium.Cartesian3());
+  Cesium.Cartesian3.normalize(dir, dir);
+  const up = Cesium.Cartesian3.normalize(camPos, new Cesium.Cartesian3());
+  viewer.camera.setView({ destination: camPos, orientation: { direction: dir, up: up } });
+  // キャプションは p の純関数 (t は p からの決定論的写像)
+  captionEl.querySelector(".en").textContent = s.cap[0];
+  captionEl.querySelector(".ja").textContent = s.cap[1];
+  captionEl.style.opacity = (s.cap[0] || s.cap[1]) ? 1 : 0;
+  hintEl.style.opacity = p > 0.02 ? 0 : 1;
+  viewer.scene.requestRender();
+  return t;
+}
+
+let lastNow = performance.now();
+let lastDebug = 0;
+let lastAppliedP = -1;
+function loop(now) {
+  const dt = Math.min(0.1, Math.max(0.001, (now - lastNow) / 1000));
+  lastNow = now;
+  if (overrideP === null) targetP = scrollTargetP();
+  // follow: 指数減衰 rate 6.5、最大速度 0.07/150ms でクランプ (オーバーシュートなし)
+  let delta = (targetP - dispP) * (1 - Math.exp(-6.5 * dt));
+  const maxDelta = 0.07 * (dt * 1000 / 150);
+  if (delta > maxDelta) delta = maxDelta; else if (delta < -maxDelta) delta = -maxDelta;
+  if (Math.abs(targetP - dispP) < 0.00005) delta = targetP - dispP;
+  dispP = clamp01(dispP + delta);
+  // 描画は p が実際に変化した時だけ: 毎フレーム requestRender すると requestRenderMode でも
+  // レンダリングが連続し、タイル処理ワーカーからの結果反映が starve する (実測: processing 固定)
+  let t = Math.min(1, dispP / 0.94) * DURATION;
+  if (Math.abs(dispP - lastAppliedP) > 1e-6) {
+    t = applyP(dispP, true);
+    lastAppliedP = dispP;
+  }
+  if (DEBUG && now - lastDebug > 120) {
+    lastDebug = now;
+    debugEl.textContent =
+      "route=" + ROUTE_ID + " grade=" + GRADE_ID + " render=" + (RENDER_LOOP ? "loop" : "rrm") +
+      " renderer=" + RENDERER + " terrain=" + TERRAIN +
+      " tiles=" + (TILES_PROXY ? "proxy" : "direct") + "\n" +
+      "p(target)=" + targetP.toFixed(4) + " p=" + dispP.toFixed(4) + " t=" + t.toFixed(2) + "s / " + DURATION + "s\n" +
+      "heightfix=" + (HEIGHTFIX ? "on" : "off") +
+      (lastSample ? " camH(ellip)=" + lastSample.cam[2].toFixed(1) + " base=" + lastSample.baseCam.toFixed(1) +
+        " camAGL=" + (lastSample.cam[2] - lastSample.baseCam).toFixed(1) + "m" : "") + "\n" +
+      (RENDERER === "model"
+        ? "models=" + modelsLoaded + "/" + modelsTotal + " failed=" + modelsFailed + (modelsError ? " ERROR " + modelsError : "")
+        : "tileset=" + (tileset ? "added" : (tilesetError ? "ERROR" : "loading")) +
+          " tilesLoaded=" + (tileset ? tileset.tilesLoaded : false) +
+          " pending=" + (typeof pendingNow === "function" ? pendingNow() : statPending) +
+          " processing=" + (typeof processingNow === "function" ? processingNow() : statProcessing));
+  }
+  requestAnimationFrame(loop);
+}
+applyP(dispP, true);
+requestAnimationFrame(loop);
+
+// カメラが実座標ルート上に載ってからオルソ画像レイヤを追加 (初回フレームの氾濫回避)
+const imageryErrors = [];
+setTimeout(() => {
+  const provider = new Cesium.UrlTemplateImageryProvider({
+    url: ORTHO_URL,
+    tilingScheme: new Cesium.WebMercatorTilingScheme(),
+    // minimumLevel は指定しない (=0)。10 を指定すると Cesium が低レベル地表タイル用に
+    // レベル10タイルを広域に要求し続け、カメラ付近 (仙台) のタイルに到達しないことを
+    // 2026-11-22 の切り分けで確認 (要求が x=513 の列に滞留し全て 404、正規タイルは要求されず)。
+    // PLATEAU-Ortho に無い z<10 は 404 になるが Cesium は親方向の失敗を許容して精細化が進む。
+    // maximumLevel は 18: PLATEAU-Ortho の実在上限は z18 (z19 は 404 を実測、2026-11-22 地形検証)。
+    // 19 のままだと DEM 地形が深いレベルまで細分された際に対応 imagery が全て 404 になる。
+    maximumLevel: 18
+  });
+  provider.errorEvent.addEventListener(e => {
+    imageryErrors.push(String(e && e.message ? e.message : e));
+    if (imageryErrors.length > 20) imageryErrors.shift();
+  });
+  const layer = viewer.imageryLayers.addImageryProvider(provider);
+  applyImageryGrade(layer);
+  viewer.scene.requestRender();
+}, 300);
+
+// ---- Verification hooks ----
+window.__viewer = viewer; // 検証用 (sampleHeightMostDetailed 等で scene を引くため)
+window.__setP = (p) => {
+  if (p === null || p === undefined) { overrideP = null; targetP = scrollTargetP(); return; }
+  overrideP = clamp01(p);
+  targetP = overrideP;
+  dispP = overrideP; // 決定的検証のため即時反映 (follow を介さない)
+  applyP(dispP, true);
+};
+function pendingNow() {
+  if (statPending >= 0) return statPending;
+  if (tileset && tileset.statistics) return tileset.statistics.numberOfPendingRequests;
+  return -1;
+}
+function processingNow() {
+  if (statProcessing >= 0) return statProcessing;
+  if (tileset && tileset.statistics) return tileset.statistics.numberOfTilesProcessing;
+  return -1;
+}
+window.__ready = () => RENDERER === "model"
+  ? (modelsTotal > 0 && modelsLoaded + modelsFailed >= modelsTotal && modelsLoaded > 0)
+  : (!!tileset && tileset.tilesLoaded && pendingNow() <= 0);
+window.__getState = () => ({
+  route: ROUTE_ID, grade: GRADE_ID, renderer: RENDERER, heightfix: HEIGHTFIX,
+  terrain: TERRAIN,
+  demStats: TERRAIN === "dem" ? { ...demStats, cacheSize: demTileCache.size } : null,
+  gradeState: {
+    sunTimeISO: Cesium.JulianDate.toDate(viewer.clock.currentTime).toISOString(),
+    lightIntensity: viewer.scene.light && viewer.scene.light.intensity,
+    fogDensity: viewer.scene.fog.density,
+    fogColor: ("color" in viewer.scene.fog) ? Cesium.Color.toCss(viewer.scene.fog.color) : null,
+    atmoHue: viewer.scene.skyAtmosphere.hueShift,
+    atmoSat: viewer.scene.skyAtmosphere.saturationShift,
+    atmoBri: viewer.scene.skyAtmosphere.brightnessShift,
+    imagery: viewer.imageryLayers.length ? {
+      brightness: viewer.imageryLayers.get(0).brightness,
+      contrast: viewer.imageryLayers.get(0).contrast,
+      saturation: viewer.imageryLayers.get(0).saturation,
+      gamma: viewer.imageryLayers.get(0).gamma
+    } : null,
+    tilesetIBL: (tileset && tileset.imageBasedLightingFactor)
+      ? [tileset.imageBasedLightingFactor.x, tileset.imageBasedLightingFactor.y] : null,
+    lights: LIGHTS ? lightsCount : 0
+  },
+  camEllipsoidal: lastSample ? +lastSample.cam[2].toFixed(2) : null,
+  camBase: lastSample ? +lastSample.baseCam.toFixed(2) : null,
+  camAGL: lastSample ? +(lastSample.cam[2] - lastSample.baseCam).toFixed(2) : null,
+  lookEllipsoidal: lastSample ? +lastSample.look[2].toFixed(2) : null,
+  lookBase: lastSample ? +lastSample.baseLook.toFixed(2) : null,
+  lookAGL: lastSample ? +(lastSample.look[2] - lastSample.baseLook).toFixed(2) : null,
+  pTarget: targetP, p: dispP, t: Math.min(1, dispP / 0.94) * DURATION,
+  tilesetAdded: !!tileset, tilesLoaded: tileset ? tileset.tilesLoaded : false,
+  pending: pendingNow(), processing: processingNow(), error: tilesetError,
+  modelsTotal, modelsLoaded, modelsFailed, modelsError,
+  imageryLayers: viewer.imageryLayers.length,
+  imageryErrors: imageryErrors.slice(0, 5),
+  globeShow: viewer.scene.globe.show,
+  globeTilesLoaded: viewer.scene.globe.tilesLoaded
+});
+window.__duration = DURATION;
+window.__applyTime = (t) => { // 後方互換 (sendai-real の検証スクリプト形式)
+  window.__setP((t / DURATION) * 0.94);
+  return { tilesLoaded: tileset ? tileset.tilesLoaded : false };
+};
+</script>
+</body>
+</html>
