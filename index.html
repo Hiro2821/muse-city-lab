@@ -34,6 +34,12 @@
                      ジオイド高は PLATEAU 実ジオメトリ (b3dm を Draco 復号し頂点の最低高度を実測) と
                      DEM の差の中央値 (n=25, 市街地, 標準偏差 0.54m) で較正。詳細は README と
                      tools/measure_base.py / tools/base-measure.json を参照。
+    ?mobile=1|0      iPhone 向け軽量プロファイル。無指定時は自動判定 (タッチ主体+小画面、
+                     または iOS UA のとき有効)。有効時: tileset SSE 32、resolutionScale 1.5、
+                     globe SSE 3、DEM heightmap 33x33、DEM キャッシュ上限 24 枚、
+                     tileset キャッシュ 128MiB 上限。デスクトップの既定挙動は変えない。
+    ?sse=<num>       tileset の maximumScreenSpaceError の上書き (全プロファイル共通)。
+                     無指定時は desktop=16 / mobile=32。
     ?debug=1         デバッグ表示
   検証窓口: window.__setP(p) / window.__ready() / window.__getState()
 -->
@@ -99,6 +105,34 @@ const TERRAIN = Q.get("terrain") === "dem" ? "dem" : "ellipsoid"; // 地形プ�
 const LIGHTS = Q.get("lights") === "on"; // 窓明かり点群 (試作レイヤ)
 const DEBUG = Q.get("debug") === "1";
 
+// ---- iPhone 向け軽量プロファイル (?mobile=1|0、無指定時は自動判定) ----
+// 経緯: 2026-11-22、Shibu の iPhone / Safari で ?route=v2&terrain=dem を開くと
+// 「問題が繰り返し起きました」(Web コンテンツプロセスの繰り返しクラッシュ) で表示不能だった。
+// 原因の断定はできないが、負荷側の候補は (a) DEM 地形のタイル処理 (65x65 サンプル/タイル、
+// デコード済みタイルの無制限キャッシュ)、(b) tileset の SSE 16 + 既定キャッシュ (512MiB 級)、
+// (c) devicePixelRatio 3 でのフル解像度描画。プロファイルはこの3点をまとめて下げる。
+// 既定値の決め方: 明示パラメータが最優先。無指定時は「タッチ主体 + 小画面、または iOS UA」の
+// ときだけ自動で有効にする。デスクトップ検証環境 (VM Chromium、非タッチ) では自動判定が
+// 入らないため、従来の検証挙動は変わらない。本編のティア思想と同様、プロファイル外の
+// 既定 (SSE 16 等) は検証なしに変えない。
+const MOBILE_AUTO = (() => {
+  try {
+    const coarse = !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+    const small = Math.min(window.screen.width || 9999, window.screen.height || 9999) <= 820;
+    const iosUA = /iPhone|iPad|iPod/.test(navigator.userAgent || "");
+    return (coarse && small) || iosUA;
+  } catch (e) { return false; }
+})();
+const MOBILE = Q.get("mobile") === "1" ? true : Q.get("mobile") === "0" ? false : MOBILE_AUTO;
+// ?sse= は全プロファイル共通の上書き (tileset の maximumScreenSpaceError)
+const SSE_PARAM = parseFloat(Q.get("sse"));
+const TILESET_SSE = Number.isFinite(SSE_PARAM) && SSE_PARAM > 0 ? SSE_PARAM : (MOBILE ? 32 : 16);
+const RES_SCALE = MOBILE ? 1.5 : null;              // null = Cesium 既定 (devicePixelRatio 追従)
+const HM_SIZE = MOBILE ? 33 : 65;                   // DEM heightmap の辺サンプル数
+const DEM_CACHE_CAP = MOBILE ? 24 : 96;             // DEM デコード済みタイルの保持上限 (1枚 256KiB)
+const TILESET_CACHE_BYTES = MOBILE ? 128 * 1024 * 1024 : null;    // null = Cesium 既定
+const TILESET_OVERFLOW_BYTES = MOBILE ? 64 * 1024 * 1024 : null;  // null = Cesium 既定
+
 // ---- Data sources: direct https is canonical; /remote/ proxy only for local VM verification ----
 const PLATEAU_HOST = "assets.cms.plateau.reearth.io";
 const TILESET_PATH = "/assets/29/10aacf-3830-4ded-8adc-f58ecc71772e/04100_sendai-shi_city_2024_citygml_1_op_bldg_3dtiles_04101_aoba-ku_lod2/tileset.json";
@@ -123,11 +157,15 @@ const GEOID_H = 40.67; // 仙台市街地のジオイド高 (heightfix 較正値
 const DEM_URL = (z, x, y) => TILES_PROXY
   ? "/remote/" + DEM_HOST + "/xyz/dem_png/" + z + "/" + x + "/" + y + ".png"
   : "https://" + DEM_HOST + "/xyz/dem_png/" + z + "/" + x + "/" + y + ".png";
-const demStats = { fetches: 0, fetchBytes: 0, failures: 0, tilesDecoded: 0 };
+const demStats = { fetches: 0, fetchBytes: 0, failures: 0, tilesDecoded: 0, callbacks: 0 };
 const demTileCache = new Map(); // "z/x/y" -> Promise<Float32Array(256*256) | null> 標高 (m、無効値は NaN)
 function loadDemTile(z, x, y) {
   const key = z + "/" + x + "/" + y;
-  if (demTileCache.has(key)) return demTileCache.get(key);
+  if (demTileCache.has(key)) {
+    const hit = demTileCache.get(key);
+    demTileCache.delete(key); demTileCache.set(key, hit); // LRU: ヒットで末尾へ
+    return hit;
+  }
   const promise = (async () => {
     try {
       demStats.fetches++;
@@ -151,6 +189,12 @@ function loadDemTile(z, x, y) {
     } catch (e) { demStats.failures++; return null; }
   })();
   demTileCache.set(key, promise);
+  // 保持上限を超えたら古いものから捨てる。1枚 = Float32Array(256*256) = 256KiB なので、
+  // 無制限だと移動に比例して増え続ける (VM 実測では 1 セッション 65〜83 枚 = 17〜21MiB、
+  // それ以外にデコード時の一時 bitmap/canvas も同程度発生する)。捨てたタイルは必要時に再取得する。
+  while (demTileCache.size > DEM_CACHE_CAP) {
+    demTileCache.delete(demTileCache.keys().next().value);
+  }
   return promise;
 }
 // 標高タイル (256px) から任意地点の標高を双線形補間で引く。px はタイル内ピクセル座標 (中心基準)。
@@ -165,8 +209,9 @@ function demSampleBilinear(data, px, py) {
   }
   return wsum > 0 ? sum / wsum : NaN;
 }
-const HM_W = 65, HM_H = 65; // heightmap のサンプル数 (タイル辺あたり)
+const HM_W = HM_SIZE, HM_H = HM_SIZE; // heightmap のサンプル数 (タイル辺あたり)。mobile は 33 (頂点数・補間計算とも約 1/4)
 async function demHeights(x, y, level) {
+  demStats.callbacks++;
   const out = new Float32Array(HM_W * HM_H); // 既定 0 = 楕円体 (取得失敗・無効値の代替)
   const srcLevel = Math.min(level, DEM_MAX_LEVEL);
   const scale = Math.pow(2, level - srcLevel); // 要求タイルが元タイルの 1/scale の大きさ
@@ -218,6 +263,10 @@ const viewer = new Cesium.Viewer("cesiumContainer", {
   navigationHelpButton: false, fullscreenButton: false,
   requestRenderMode: !RENDER_LOOP, maximumRenderTimeChange: Infinity
 });
+// 軽量プロファイルの描画側: 解像度スケールを 1.5 に抑える (iPhone DPR 3 のままだと
+// 描画ピクセル数が約4倍になる) + 地球タイルの SSE を 2→3 に緩めて地形/画像タイル数を減らす。
+if (RES_SCALE) viewer.resolutionScale = RES_SCALE;
+if (MOBILE) viewer.scene.globe.maximumScreenSpaceError = 3;
 
 // ---- Grade presets (本格版, 2026-11-22 夜・夕方再構成の検証で実装) ----
 // 方針: 太陽位置は viewer.clock の JulianDate を正とし、Cesium の大気散乱
@@ -349,7 +398,10 @@ if (RENDERER === "model") {
     });
 } else {
   Cesium.Cesium3DTileset.fromUrl(TILESET_URL, {
-    maximumScreenSpaceError: 16
+    maximumScreenSpaceError: TILESET_SSE,
+    // 軽量プロファイルでは tileset の保持キャッシュにも上限を付ける (Cesium 既定は 512MiB 級で、
+    // iPhone Safari のプロセス上限に対して大きい)。デスクトップでは既定のまま (undefined)。
+    ...(TILESET_CACHE_BYTES ? { cacheBytes: TILESET_CACHE_BYTES, maximumCacheOverflowBytes: TILESET_OVERFLOW_BYTES } : {})
   }).then(ts => {
     tileset = ts;
     viewer.scene.primitives.add(ts);
@@ -538,7 +590,7 @@ function loop(now) {
     lastDebug = now;
     debugEl.textContent =
       "route=" + ROUTE_ID + " grade=" + GRADE_ID + " render=" + (RENDER_LOOP ? "loop" : "rrm") +
-      " renderer=" + RENDERER + " terrain=" + TERRAIN +
+      " renderer=" + RENDERER + " terrain=" + TERRAIN + " mobile=" + (MOBILE ? 1 : 0) + " sse=" + TILESET_SSE +
       " tiles=" + (TILES_PROXY ? "proxy" : "direct") + "\n" +
       "p(target)=" + targetP.toFixed(4) + " p=" + dispP.toFixed(4) + " t=" + t.toFixed(2) + "s / " + DURATION + "s\n" +
       "heightfix=" + (HEIGHTFIX ? "on" : "off") +
@@ -604,6 +656,11 @@ window.__ready = () => RENDERER === "model"
 window.__getState = () => ({
   route: ROUTE_ID, grade: GRADE_ID, renderer: RENDERER, heightfix: HEIGHTFIX,
   terrain: TERRAIN,
+  profile: {
+    mobile: MOBILE, mobileAuto: MOBILE_AUTO, sse: TILESET_SSE,
+    resolutionScale: viewer.resolutionScale, globeSSE: viewer.scene.globe.maximumScreenSpaceError,
+    hmSize: HM_SIZE, demCacheCap: DEM_CACHE_CAP, tilesetCacheBytes: TILESET_CACHE_BYTES
+  },
   demStats: TERRAIN === "dem" ? { ...demStats, cacheSize: demTileCache.size } : null,
   gradeState: {
     sunTimeISO: Cesium.JulianDate.toDate(viewer.clock.currentTime).toISOString(),
